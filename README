@@ -19,3 +19,14 @@ Copyright (c) 2012 Mark Allen
 
 This program is free software; you can redistribute it and/or modify it
 under the same terms as Perl itself.
+
+
+
+Some extra install info:
+
+yum -y install perl-Module-Install cpan
+PERL_MM_USE_DEFAULT=1 perl Makefile.PL
+make
+make install
+curl -L https://cpanmin.us | perl - App::cpanminus
+cpanm AWS::Signature4
