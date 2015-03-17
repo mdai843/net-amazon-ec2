@@ -15,6 +15,8 @@ use Params::Validate qw(validate SCALAR ARRAYREF HASHREF);
 use Data::Dumper qw(Dumper);
 use URI::Escape qw(uri_escape_utf8);
 use Carp;
+use HTTP::Request::Common;
+use AWS::Signature4;
 
 use Net::Amazon::EC2::DescribeImagesResponse;
 use Net::Amazon::EC2::DescribeKeyPairsResponse;
@@ -270,79 +272,70 @@ sub _fetch_iam_security_credentials {
 }
 
 sub _sign {
-	my $self						= shift;
-	my %args						= @_;
-	my $action						= delete $args{Action};
-	my %sign_hash					= %args;
-	my $timestamp					= $self->timestamp;
+        my $self                                = shift;
+        my %args                                = @_;
+        my $action                              = delete $args{Action};
+        my %sign_hash                           = %args;
+        my $timestamp                           = $self->timestamp;
+        my $securitytoken                       = '';
 
-	$sign_hash{AWSAccessKeyId}		= $self->AWSAccessKeyId;
-	$sign_hash{Action}				= $action;
-	$sign_hash{Timestamp}			= $timestamp;
-	$sign_hash{Version}				= $self->version;
-	$sign_hash{SignatureVersion}	= $self->signature_version;
-    $sign_hash{SignatureMethod}     = "HmacSHA256";
-	if ($self->has_temp_creds || $self->has_SecurityToken) {
-	    $sign_hash{SecurityToken} = $self->SecurityToken;
-	}
+        $sign_hash{Action}                      = $action;
+        $sign_hash{Timestamp}                   = $timestamp;
+        $sign_hash{Version}                     = $self->version;
 
+        if ($self->has_temp_creds || $self->has_SecurityToken) {
+            $securitytoken = $self->SecurityToken;
+        }
 
-	my $sign_this = "POST\n";
-	my $uri = URI->new($self->base_url);
+        my $signer = AWS::Signature4->new(-access_key => $self->AWSAccessKeyId, -secret_key => $self->SecretAccessKey, -security_token => $securitytoken);
+        my $ua = LWP::UserAgent->new();
+        my $uri = URI->new($self->base_url);
+        my $base_url = $self->base_url;
+        my @signing_elements;
 
-    $sign_this .= lc($uri->host) . "\n";
-    $sign_this .= "/\n";
+        foreach my $key (sort keys %sign_hash) {
+                push @signing_elements, uri_escape_utf8($key)."=".uri_escape_utf8($sign_hash{$key});
+        }
 
-    my @signing_elements;
+        my $content = join "&", @signing_elements;
+        my $req = POST("$base_url", Content => $content);
 
-	foreach my $key (sort keys %sign_hash) {
-		push @signing_elements, uri_escape_utf8($key)."=".uri_escape_utf8($sign_hash{$key});
-	}
+        $signer->sign($req);
 
-    $sign_this .= join "&", @signing_elements;
+        my $res = $ua->request($req);
 
-	$self->_debug("QUERY TO SIGN: $sign_this");
-	my $encoded = $self->_hashit($self->SecretAccessKey, $sign_this);
+        # We should force <item> elements to be in an array
+        my $xs  = XML::Simple->new(
+                ForceArray => qr/(?:item|Errors)/i, # Always want item elements unpacked to arrays
+                KeyAttr => '',                      # Turn off folding for 'id', 'name', 'key' elements
+                SuppressEmpty => undef,             # Turn empty values into explicit undefs
+        );
+        my $xml;
 
-    my $content = join "&", @signing_elements, 'Signature=' . uri_escape_utf8($encoded);
-
-	my $ur	= $uri->as_string();
-	$self->_debug("GENERATED QUERY URL: $ur");
-	my $ua	= LWP::UserAgent->new();
-    $ua->env_proxy;
-	my $res	= $ua->post($ur, Content => $content);
-	# We should force <item> elements to be in an array
-	my $xs	= XML::Simple->new(
-        ForceArray => qr/(?:item|Errors)/i, # Always want item elements unpacked to arrays
-        KeyAttr => '',                      # Turn off folding for 'id', 'name', 'key' elements
-        SuppressEmpty => undef,             # Turn empty values into explicit undefs
-    );
-	my $xml;
-	
-	# Check the result for connectivity problems, if so throw an error
- 	if ($res->code >= 500) {
- 		my $message = $res->status_line;
-		$xml = <<EOXML;
+        # Check the result for connectivity problems, if so throw an error
+        if ($res->code >= 500) {
+                my $message = $res->status_line;
+                $xml = <<EOXML;
 <xml>
-	<RequestID>N/A</RequestID>
-	<Errors>
-		<Error>
-			<Code>HTTP POST FAILURE</Code>
-			<Message>$message</Message>
-		</Error>
-	</Errors>
+        <RequestID>N/A</RequestID>
+        <Errors>
+                <Error>
+                        <Code>HTTP POST FAILURE</Code>
+                        <Message>$message</Message>
+                </Error>
+        </Errors>
 </xml>
 EOXML
 
- 	}
-	else {
-		$xml = $res->content();
-	}
+        }
+        else {
+                $xml = $res->content();
+        }
 
-	my $ref = $xs->XMLin($xml);
-	warn Dumper($ref) . "\n\n" if $self->debug == 1;
+        my $ref = $xs->XMLin($xml);
+        warn Dumper($ref) . "\n\n" if $self->debug == 1;
 
-	return $ref;
+        return $ref;
 }
 
 sub _parse_errors {
